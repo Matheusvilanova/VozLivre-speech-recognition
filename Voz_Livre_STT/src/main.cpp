@@ -6,7 +6,7 @@ const char* ssid = "SEU_WIFI";
 const char* password = "SUA_SENHA";
 
 // --- Configurações do Servidor UDP ---
-const char* udpAddress = "10.0.0.192"; // Ex: "192.168.1.100"
+const char* udpAddress = "192.168.1.100"; // Ex: "192.168.1.100"
 const int udpPort = 12345; // Porta que o servidor estará escutando
 
 // --- Configurações de Áudio ---
