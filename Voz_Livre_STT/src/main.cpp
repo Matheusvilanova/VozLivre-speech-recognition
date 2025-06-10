@@ -1,6 +1,6 @@
 #include <WiFi.h>
 #include <WiFiClient.h>
-
+ 
 // --- Suas configurações ---
 const char* ssid = "SEU_SSID";
 const char* password = "SUA_SENHA";

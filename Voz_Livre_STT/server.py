@@ -180,7 +180,7 @@ async def websocket_handler(websocket):
 async def main():
     """Função principal que inicia todos os servidores e threads."""
 
-
+ 
     # --- PLAYBACK DE ÁUDIO DESATIVADO ---
     #p = pyaudio.PyAudio()
     #audio_stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, output=True, frames_per_buffer=CHUNK_SIZE_PLAYBACK)
