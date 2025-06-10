@@ -1,81 +1,123 @@
 #include <WiFi.h>
-#include <WiFiUdp.h>
+#include <WiFiClient.h>
 
-// --- Configurações de Wi-Fi ---
-const char* ssid = "SEU_WIFI";
+// --- Suas configurações ---
+const char* ssid = "SEU_SSID";
 const char* password = "SUA_SENHA";
+const char* serverAddress = "SEU_IP";
+const int serverPort = 12345;
 
-// --- Configurações do Servidor UDP ---
-const char* udpAddress = "192.168.1.100"; // Ex: "192.168.1.100"
-const int udpPort = 12345; // Porta que o servidor estará escutando
+// --- Configurações de Áudio e Hardware ---
+const int sampleRate = 8000;
+const int delayBetweenSamples = 1000000 / sampleRate; // 125 us
+const int adcPin = 35;
+const int pushToTalkButtonPin = 23;
 
-// --- Configurações de Áudio ---
-const int adcPin = 34; // Pino ADC conectado à saída do LM386
-// Para uma amostragem mais consistente, interrupções de timer seriam melhores,
-// mas para simplicidade, usaremos um pequeno delay.
-// Taxa de amostragem aproximada (ajuste o delay e o tamanho do buffer conforme necessário)
-const int sampleRate = 8000; // Amostras por segundo (Hz)
-const int delayTime = 1000000 / sampleRate;
+size_t recordedAudioSize = 0;
 
-WiFiUDP udp;
-uint8_t audioBuffer[128]; // Buffer para amostras de áudio (8-bit)
-int bufferIndex = 0;
+// --- Buffer de Gravação ---
+const int RECORDING_SECONDS = 10; // Grave por até 10 segundos
+const int RECORD_BUFFER_SIZE = sampleRate * RECORDING_SECONDS; // 8000 * 10 = 80000 bytes
+byte* audioBuffer = NULL; // O buffer será alocado dinamicamente
+
+WiFiClient client;
+
+// --- Estados do Programa ---
+enum State { IDLE, RECORDING, SENDING };
+State currentState = IDLE;
 
 void setup() {
   Serial.begin(115200);
+  pinMode(pushToTalkButtonPin, INPUT_PULLUP);
 
-  // Configurar ADC (opcional, mas bom para consistência)
-  // adcAttachPin(adcPin);
-  // analogReadResolution(10); // 10-bit (0-1023). Padrão é 12-bit (0-4095)
-  // analogSetAttenuation(ADC_11db); // Permite ler até ~3.3V
+  // Aloca o buffer de áudio na memória RAM
+  audioBuffer = (byte*) malloc(RECORD_BUFFER_SIZE);
+  if (audioBuffer == NULL) {
+    Serial.println("Falha ao alocar memória para o buffer de áudio!");
+    while(1); // Trava aqui se não houver memória
+  }
 
-  // --- Conectar ao Wi-Fi ---
+  // --- Conexão Wi-Fi ---
   WiFi.begin(ssid, password);
   Serial.print("Conectando ao WiFi...");
   while (WiFi.status() != WL_CONNECTED) {
-    delay(1000);
+    delay(500);
     Serial.print(".");
   }
-  Serial.println("\nConectado!");
-  Serial.print("Endereço IP do ESP32: ");
+  Serial.println("\nWiFi Conectado!");
+  Serial.print("Endereço IP: ");
   Serial.println(WiFi.localIP());
-
-  int adcValue = analogRead(34); 
-  Serial.println(adcValue); // Imprime o valor lido
-  delay(50);
-
-  // --- Iniciar UDP ---
-  if (udp.begin(WiFi.localIP(), udpPort)) { // Pode usar qualquer porta local disponível ou 0
-    Serial.println("UDP iniciado.");
-  } else {
-    Serial.println("Falha ao iniciar UDP.");
-  }
+  Serial.println("Estado: AGUARDANDO. Pressione o botão para gravar.");
 }
 
 void loop() {
-  // Ler valor do ADC
-  int adcValue = analogRead(adcPin); // 0-4095 (se 12-bit)
+  switch (currentState) {
+    case IDLE:
+      // Se o botão for pressionado, muda para o estado de gravação
+      if (digitalRead(pushToTalkButtonPin) == LOW) {
+        Serial.println("Estado: GRAVANDO... Solte para enviar.");
+        currentState = RECORDING;
+      }
+      break;
 
-  // Mapear para 8-bit (0-255) - ajuste conforme a saída real do seu LM386
-  // O sinal de áudio é AC, então ele varia acima e abaixo de um ponto central.
-  // Se o seu LM386 estiver bem configurado e o sinal ocupar boa parte da faixa do ADC,
-  // você pode simplesmente pegar os 8 bits mais significativos ou escalar.
-  // Exemplo simples de escalonamento (pode precisar de ajuste/calibração):
-  uint8_t sample = map(adcValue, 0, 4095, 0, 255);
-  // Ou, se o sinal estiver centrado em VCC/2 (aprox. 2048 para 12-bit ADC):
-  // int16_t signedSample = adcValue - 2048; // Exemplo se quiser amostras com sinal
-  // sample = (uint8_t)((signedSample >> 4) + 128); // Converter para 8-bit sem sinal
+    case RECORDING: { // Usamos chaves aqui para criar um escopo local para as novas variáveis
+      // --- LÓGICA DE TIMING PRECISO ---
+      unsigned long next_sample_time_us = micros();
+      const unsigned long sample_period_us = 1000000 / sampleRate; // 125 microssegundos
 
-  audioBuffer[bufferIndex++] = sample;
+      recordedAudioSize = 0; // Reseta o tamanho antes de iniciar
 
-  if (bufferIndex == sizeof(audioBuffer)) {
-    // Enviar buffer cheio via UDP
-    udp.beginPacket(udpAddress, udpPort);
-    udp.write(audioBuffer, sizeof(audioBuffer));
-    udp.endPacket();
-    bufferIndex = 0; // Resetar índice do buffer
-    // Serial.println("Pacote de áudio enviado");
+      for (int i = 0; i < RECORD_BUFFER_SIZE; i++) {
+        // Se o botão for solto, para a gravação
+        if (digitalRead(pushToTalkButtonPin) == HIGH) {
+          recordedAudioSize = i; // Salva o número de bytes realmente gravados
+          break; 
+        }
+        
+        // ESPERA ATÉ O MOMENTO EXATO DA PRÓXIMA AMOSTRA
+        while (micros() < next_sample_time_us) {
+          // Espera ativa (busy-waiting). Não faz nada até a hora certa.
+        }
+        
+        // Captura a amostra
+        int adcValue = analogRead(adcPin);
+        audioBuffer[i] = map(adcValue, 0, 4095, 0, 255);
+        
+        // Calcula o tempo para a PRÓXIMA amostra
+        next_sample_time_us += sample_period_us;
+      }
+      
+      // Se saiu do loop, a gravação terminou
+      if (recordedAudioSize == 0) { // Se não quebrou antes, o buffer encheu
+        recordedAudioSize = RECORD_BUFFER_SIZE;
+      }
+      Serial.print("Gravação finalizada. ");
+      Serial.print(recordedAudioSize / (float)sampleRate, 2);
+      Serial.println(" segundos de áudio capturados.");
+      
+      currentState = SENDING;
+      break;
+    } // Fim do case RECORDING
+
+    case SENDING:
+      // O seu case SENDING que já funciona com client.flush() e delay() continua aqui...
+      Serial.println("Estado: ENVIANDO...");
+      if (client.connect(serverAddress, serverPort)) {
+        Serial.println("Conectado ao servidor para envio.");
+        client.write(audioBuffer, recordedAudioSize);
+        Serial.println("Aguardando finalização do envio (flush)...");
+        client.flush(); 
+        delay(200); 
+        Serial.println("Envio concluído. Fechando conexão.");
+        client.stop();
+      } else {
+        Serial.println("Falha ao conectar ao servidor para envio.");
+      }
+      
+      recordedAudioSize = 0;
+      currentState = IDLE;
+      Serial.println("\nEstado: AGUARDANDO. Pressione o botão para gravar.");
+      delay(500);
+      break;
   }
-
-  delayMicroseconds(delayTime); // Controla a taxa de amostragem
 }

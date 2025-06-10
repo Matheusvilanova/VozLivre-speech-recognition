@@ -5,260 +5,208 @@ import threading
 import queue
 import asyncio
 import websockets
-import json # Usaremos para mensagens mais estruturadas, se necessário
+import time
 
-# --- Configurações do Servidor UDP ---
-UDP_IP = "0.0.0.0"
-UDP_PORT = 12345
+# --- 1. Configurações Globais ---
+# Rede
+TCP_IP = "0.0.0.0"          # Escutar em todas as interfaces de rede
+TCP_PORT = 12345            # Porta para o ESP32 se conectar
+WEBSOCKET_IP = "0.0.0.0"
+WEBSOCKET_PORT = 8765       # Porta para a página web se conectar
 
-# --- Configurações de Áudio (devem corresponder ao ESP32) ---
-FORMAT = pyaudio.paUInt8
-CHANNELS = 1
-RATE = 8000
-CHUNK_SIZE = 128 # Tamanho do buffer de áudio recebido do ESP32
+# Áudio
+RATE = 8000                 # Taxa de amostragem (DEVE ser igual à do ESP32)
+FORMAT = pyaudio.paUInt8    # Formato do áudio (8-bit sem sinal)
+CHANNELS = 1                # Mono
+CHUNK_SIZE_PLAYBACK = 1024  # Tamanho do buffer para o playback no PyAudio
 
-# --- Configurações do Servidor WebSocket ---
-WEBSOCKET_IP = "0.0.0.0" # Escutar em todas as interfaces
-WEBSOCKET_PORT = 8765
-
-# --- Globais para WebSocket e STT ---
-# Mantém o controle de todos os clientes WebSocket conectados
+# --- 2. Variáveis de Estado Globais ---
+# Fila para passar o bloco de áudio completo para a thread de STT
+stt_processing_queue = queue.Queue()
+# Conjuntos para gerenciar clientes WebSocket
 connected_websockets = set()
-# Mantém o controle dos clientes que querem receber transcrições
 transcription_subscribers = set()
-
-audio_processing_queue = queue.Queue()
+# Lock para proteger o acesso aos sets por múltiplas threads
+clients_lock = threading.Lock()
+# Objeto de reconhecimento de fala
 recognizer = sr.Recognizer()
 
-# Lock para acesso seguro aos sets de WebSockets por múltiplas threads/tasks
-clients_lock = threading.Lock() # Usaremos Lock do threading pois STT worker é uma thread síncrona
+# --- 3. Definições de Funções ---
 
-# --- Inicializações (PyAudio, Socket UDP) ---
-# Estas inicializações foram movidas para a função principal ou para onde são usadas
-# para evitar duplicação e garantir que sejam feitas no contexto correto.
-p = None
-audio_stream = None # Renomeado de 'stream' para evitar conflito com streams de websockets
-udp_sock = None
-
-
-async def send_transcription_to_subscribers(text_message):
-    """Envia a mensagem de texto para todos os clientes WebSocket inscritos."""
-    # Esta função será chamada pela thread STT usando asyncio.run_coroutine_threadsafe
-    # já que a thread STT é síncrona e o envio do WebSocket é assíncrono.
-    if transcription_subscribers: # Verifica se há inscritos
-        # Cria uma cópia do set para iterar, caso ele seja modificado durante a iteração
-        # Embora com o lock, talvez não seja estritamente necessário, é mais seguro.
-        current_subscribers = set()
+async def send_to_subscribers(text_message):
+    """Envia uma mensagem para todos os clientes WebSocket inscritos."""
+    if transcription_subscribers:
         with clients_lock:
-            current_subscribers = transcription_subscribers.copy()
-        
-        # websockets.broadcast envia para uma lista de conexões
-        # Se precisar enviar individualmente com tratamento de erro por cliente:
-        # tasks = [ws.send(text_message) for ws in current_subscribers]
-        # await asyncio.gather(*tasks, return_exceptions=True) # Envia para todos e lida com exceções
-        
-        # Simplesmente iterando e enviando (pode ser melhorado com error handling por cliente)
-        print(f"WebSocket: Enviando texto '{text_message}' para {len(current_subscribers)} inscritos.")
-        for ws_client in current_subscribers:
-            try:
-                await ws_client.send(text_message)
-            except websockets.exceptions.ConnectionClosed:
-                print(f"WebSocket: Conexão com {ws_client.remote_address} fechada ao tentar enviar.")
-                # Remover o cliente se a conexão foi fechada (será feito no handler principal também)
-                pass # O handler principal deve cuidar da remoção
-            except Exception as e_ws_send:
-                print(f"WebSocket: Erro ao enviar para {ws_client.remote_address}: {e_ws_send}")
+            # Cria uma cópia para evitar problemas se o set for modificado durante a iteração
+            subscribers_copy = list(transcription_subscribers)
+        if subscribers_copy:
+            # websockets.broadcast envia para uma lista de conexões de forma eficiente
+            websockets.broadcast(subscribers_copy, text_message)
+            print(f"WebSocket: Mensagem enviada para {len(subscribers_copy)} inscritos.")
 
-
-def stt_worker(loop_for_async_tasks):
-    """Esta função roda em uma thread separada para processar o áudio."""
-    global recognizer
+def stt_worker(loop):
+    """
+    Thread que realiza o Speech-to-Text e envia APENAS o resultado final
+    bem-sucedido para os clientes WebSocket.
+    """
+    print("Thread STT: Iniciada e pronta.")
     while True:
         try:
-            audio_chunk_bytes = audio_processing_queue.get(block=True)
-            if audio_chunk_bytes is None:
-                print("Thread STT: Recebido sinal para parar.")
-                # Enviar mensagem de parada para a web também pode ser útil
-                # asyncio.run_coroutine_threadsafe(send_transcription_to_subscribers("Servidor STT: Worker parado."), loop_for_async_tasks)
-                break
+            full_audio_bytes = stt_processing_queue.get(block=True)
+            if full_audio_bytes is None: break
 
-            audio_segment = sr.AudioData(audio_chunk_bytes, RATE, 1)
-
-            log_msg_stt = "Servidor STT: Tentando reconhecer áudio..."
-            print(log_msg_stt)
-            asyncio.run_coroutine_threadsafe(send_transcription_to_subscribers(log_msg_stt), loop_for_async_tasks)
-
+            audio_segment = sr.AudioData(full_audio_bytes, RATE, 1)
+            
+            # 1. Imprime o status no console do servidor para depuração
+            print("Servidor STT: Tentando reconhecer áudio...")
+            # A linha abaixo que enviava o status para a web foi REMOVIDA.
+            
             try:
+                # 2. Tenta reconhecer o texto
                 text = recognizer.recognize_google(audio_segment, language='pt-BR')
-                log_msg_stt = f"Servidor STT - Texto Reconhecido: {text}"
-                print(log_msg_stt)
-                if text: # Somente envia se houver texto
-                    asyncio.run_coroutine_threadsafe(send_transcription_to_subscribers(log_msg_stt), loop_for_async_tasks)
+                
+                # 3. Se o reconhecimento for bem-sucedido e gerar um texto:
+                print(f"Thread STT - Texto Reconhecido: {text}")
+                
+                # ENVIA APENAS O TEXTO PURO E RECONHECIDO PARA A PÁGINA WEB
+                if text: 
+                    # Cria a mensagem final, que pode ser só o texto ou um prefixo
+                    # final_message = f"Transcrição: {text}"
+                    final_message = text # Enviando apenas o texto puro
+                    asyncio.run_coroutine_threadsafe(send_to_subscribers(final_message), loop)
 
             except sr.UnknownValueError:
-                log_msg_stt = "Servidor STT: Google não entendeu o áudio."
-                print(log_msg_stt)
-                asyncio.run_coroutine_threadsafe(send_transcription_to_subscribers(log_msg_stt), loop_for_async_tasks)
+                # Se o Google não entender, apenas imprime no console do servidor. NADA é enviado para a web.
+                print("Thread STT: Google não entendeu o áudio.")
             except sr.RequestError as e:
-                log_msg_stt = f"Servidor STT: Erro na API do Google; {e}"
-                print(log_msg_stt)
-                asyncio.run_coroutine_threadsafe(send_transcription_to_subscribers(log_msg_stt), loop_for_async_tasks)
+                # Se houver um erro de API, apenas imprime no console do servidor. NADA é enviado para a web.
+                print(f"Thread STT: Erro na API do Google - {e}")
             finally:
-                audio_processing_queue.task_done()
-        except Exception as e_thread:
-            log_msg_stt = f"Servidor STT: Erro na thread - {e_thread}"
-            print(log_msg_stt)
-            asyncio.run_coroutine_threadsafe(send_transcription_to_subscribers(log_msg_stt), loop_for_async_tasks)
+                stt_processing_queue.task_done()
+        except Exception as e:
+            print(f"Erro na thread STT: {e}")
     print("Thread STT: Finalizada.")
 
-
-async def websocket_handler(websocket):  # <--- IMPORTANTE: APENAS 'websocket' COMO ARGUMENTO AQUI
-    """Lida com cada conexão WebSocket do cliente (página web)."""
-    global connected_websockets, transcription_subscribers
+def tcp_walkie_talkie_handler(conn, addr, audio_stream):
+    """Recebe um bloco completo de áudio de uma conexão TCP, toca e enfileira para STT."""
+    print(f"Thread TCP: Conexão de {addr} estabelecida, aguardando dados...")
     
-    # Tenta obter o 'path' como um atributo do objeto websocket
+    all_data = bytearray()
+    
     try:
-        path = websocket.path 
+        while True:
+            # Recebe dados em pedaços (chunks) até a conexão ser fechada pelo ESP32
+            data = conn.recv(4096)
+            if not data:
+                break # Sai do loop quando o ESP32 fechar a conexão
+            all_data.extend(data)
+
+        print(f"Thread TCP: Transmissão de {addr} finalizada. Total de bytes recebidos: {len(all_data)}")
+        
+        if all_data:
+
+            # --- PLAYBACK DE ÁUDIO DESATIVADO ---
+            # Toca o áudio recebido
+            #print("Reproduzindo áudio recebido...")
+            #if audio_stream and audio_stream.is_active():
+            #    audio_stream.write(bytes(all_data))
+
+
+            # Envia o bloco de áudio completo para a thread de STT
+            print("Enviando áudio para transcrição...")
+            stt_processing_queue.put(bytes(all_data))
+
+    except Exception as e:
+        print(f"Thread TCP: Erro na conexão {addr}: {e}")
+    finally:
+        conn.close()
+        print(f"Thread TCP: Conexão com {addr} fechada.")
+
+
+def tcp_server_loop(audio_stream):
+    """Loop principal que aceita conexões TCP do ESP32."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp_sock:
+        tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        tcp_sock.bind((TCP_IP, TCP_PORT))
+        tcp_sock.listen()
+        print(f"Servidor TCP (modo Walkie-Talkie) escutando em {TCP_IP}:{TCP_PORT}")
+        while True:
+            try:
+                conn, addr = tcp_sock.accept()
+                # Inicia uma nova thread para lidar com este cliente
+                client_handler_thread = threading.Thread(
+                    target=tcp_walkie_talkie_handler, 
+                    args=(conn, addr, audio_stream), 
+                    daemon=True
+                )
+                client_handler_thread.start()
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                print(f"Servidor TCP: Erro ao aceitar conexão: {e}")
+                break
+    print("Servidor TCP: Finalizado.")
+
+
+async def websocket_handler(websocket):
+    """Lida com cada conexão WebSocket da página web."""
+    try:
+        path = websocket.path
     except AttributeError:
-        path = "N/A (path attribute not found)" # Lida com o caso de não existir o atributo
-    
+        path = "N/A"
+        
     print(f"WebSocket: Cliente {websocket.remote_address} conectado ao path '{path}'.")
     with clients_lock:
         connected_websockets.add(websocket)
-    
     try:
+        await websocket.send("Servidor: Conectado! Pressione o botão no dispositivo para gravar e enviar.")
         async for message in websocket:
-            print(f"WebSocket: Recebido de {websocket.remote_address} (path: {path}): {message}")
+            print(f"WebSocket: Recebido de {websocket.remote_address}: {message}")
             if message == "INICIAR_TRANSCRICAO":
                 with clients_lock:
                     transcription_subscribers.add(websocket)
-                print(f"WebSocket: Cliente {websocket.remote_address} INSCREVEU-SE para transcrições.")
+                await websocket.send("Servidor: Visualização ATIVADA.")
             elif message == "PAUSAR_TRANSCRICAO":
                 with clients_lock:
                     transcription_subscribers.discard(websocket)
-                print(f"WebSocket: Cliente {websocket.remote_address} CANCELOU INSCRIÇÃO para transcrições.")
-            else:
-                print(f"WebSocket: Mensagem desconhecida de {websocket.remote_address}: {message}")
-    except websockets.exceptions.ConnectionClosedOK:
-        print(f"WebSocket: Cliente {websocket.remote_address} (path: {path}) desconectou normalmente.")
-    except websockets.exceptions.ConnectionClosedError as e:
-        print(f"WebSocket: Cliente {websocket.remote_address} (path: {path}) desconectou com erro: {e}")
-    except Exception as e_ws_handler:
-        print(f"WebSocket: Erro no handler para {websocket.remote_address} (path: {path}): {e_ws_handler}")
+                await websocket.send("Servidor: Visualização PAUSADA.")
+    except websockets.exceptions.ConnectionClosed:
+        print(f"WebSocket: Cliente {websocket.remote_address} desconectou.")
     finally:
-        print(f"WebSocket: Finalizando conexão com {websocket.remote_address} (path: {path}).")
         with clients_lock:
-            connected_websockets.discard(websocket)
             transcription_subscribers.discard(websocket)
-
-
-def udp_audio_receiver_and_player_loop():
-    """Loop síncrono para receber áudio UDP e tocar/enfileirar para STT."""
-    global p, audio_stream, udp_sock # Acessa as globais
-    
-    # Buffer para acumular áudio para STT
-    stt_buffer_target_size = RATE * 1 * 3 # Acumula 3 segundos de áudio (8000 * 1 byte/amostra * 3s)
-    accumulated_audio_for_stt = bytearray()
-
-    print("Thread UDP/Player: Iniciando...")
-    while True: # Adicione uma condição de parada se necessário (ex: uma flag global)
-        try:
-            data, addr = udp_sock.recvfrom(CHUNK_SIZE)
-            
-            if audio_stream and audio_stream.is_active():
-                audio_stream.write(data)
-            
-            accumulated_audio_for_stt.extend(data)
-            
-            if len(accumulated_audio_for_stt) >= stt_buffer_target_size:
-                audio_processing_queue.put(bytes(accumulated_audio_for_stt))
-                accumulated_audio_for_stt.clear()
-        except socket.timeout: # Adicionado para não bloquear para sempre no recvfrom
-            continue 
-        except Exception as e_udp_loop:
-            print(f"Erro no loop UDP/Player: {e_udp_loop}")
-            # Se houver um erro crítico, pode ser necessário quebrar o loop
-            # ou tentar reiniciar o socket/stream, dependendo do erro.
-            # Por agora, apenas imprime e continua.
-            # Se o socket fechar, este loop vai quebrar.
-            break 
-    print("Thread UDP/Player: Finalizada.")
-
+            connected_websockets.discard(websocket)
 
 async def main():
-    """Função principal para iniciar todos os servidores e threads."""
-    global p, audio_stream, udp_sock # Modifica as globais
+    """Função principal que inicia todos os servidores e threads."""
+
+
+    # --- PLAYBACK DE ÁUDIO DESATIVADO ---
+    #p = pyaudio.PyAudio()
+    #audio_stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, output=True, frames_per_buffer=CHUNK_SIZE_PLAYBACK)
     
-    # --- Inicializações (PyAudio, Socket UDP) ---
-    # Colocadas aqui para serem inicializadas antes de qualquer uso.
-    p = pyaudio.PyAudio()
-    audio_stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, output=True, frames_per_buffer=CHUNK_SIZE)
-    
-    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp_sock.bind((UDP_IP, UDP_PORT))
-    udp_sock.settimeout(1.0) # Adiciona um timeout ao recvfrom para não bloquear indefinidamente
 
-    print(f"Servidor UDP escutando em {UDP_IP}:{UDP_PORT}")
-    print(f"Stream de áudio configurado para {RATE}Hz, formato {FORMAT}")
+    audio_stream = None
 
-    # Pega o event loop atual para passar para a thread STT (para run_coroutine_threadsafe)
-    loop = asyncio.get_event_loop()
+    # Pega o event loop atual para passar para a thread STT
+    loop = asyncio.get_running_loop()
 
-    # Inicia a thread do worker STT
-    stt_thread = threading.Thread(target=stt_worker, args=(loop,), daemon=True)
-    stt_thread.start()
+    # Inicia as threads
+    threading.Thread(target=stt_worker, args=(loop,), daemon=True).start()
+    threading.Thread(target=tcp_server_loop, args=(audio_stream,), daemon=True).start()
 
-    # Inicia o loop de recebimento de áudio UDP em uma thread separada
-    # Isso é necessário porque o servidor WebSocket (asyncio) bloqueará a thread principal.
-    udp_thread = threading.Thread(target=udp_audio_receiver_and_player_loop, daemon=True)
-    udp_thread.start()
-
-    # Inicia o servidor WebSocket
-    # Use um bloco try/except para o start_server para capturar KeyboardInterrupt ali também
-    server_instance = None
-    try:
+    # Inicia o servidor WebSocket e o mantém rodando
+    async with websockets.serve(websocket_handler, WEBSOCKET_IP, WEBSOCKET_PORT):
         print(f"Servidor WebSocket escutando em ws://{WEBSOCKET_IP}:{WEBSOCKET_PORT}")
-        async with websockets.serve(websocket_handler, WEBSOCKET_IP, WEBSOCKET_PORT) as ws_server:
-            server_instance = ws_server # Guarda a instância para referência, se necessário
-            await asyncio.Future()  # Mantém o servidor rodando indefinidamente até ser interrompido
-    except KeyboardInterrupt:
-        print("\nKeyboardInterrupt recebido no main, fechando WebSocket server...")
-    except Exception as e_main_ws:
-        print(f"Erro ao iniciar/rodar servidor WebSocket: {e_main_ws}")
-    finally:
-        print("Main: Sinalizando para threads pararem...")
-        audio_processing_queue.put(None) # Envia sinal para a thread STT parar
-        
-        # Para parar a thread UDP, você precisaria de uma flag ou fechar o socket de outra thread.
-        # Como ela é daemon, ela fechará com o programa principal se o socket der erro ou fechar.
-        # Uma forma mais limpa seria ter uma flag `running = True` e setá-la para False aqui.
-        if udp_sock:
-            print("Main: Fechando socket UDP.")
-            udp_sock.close() # Isso deve fazer a thread UDP sair do loop no recvfrom
+        await asyncio.Future()  # Roda indefinidamente
 
-        if stt_thread.is_alive():
-            print("Main: Aguardando thread STT finalizar...")
-            stt_thread.join(timeout=5)
-        if udp_thread.is_alive():
-            print("Main: Aguardando thread UDP/Player finalizar...")
-            udp_thread.join(timeout=5) # Espera a thread UDP terminar
-        
-        if audio_stream and audio_stream.is_active():
-            print("Main: Parando e fechando stream PyAudio.")
-            audio_stream.stop_stream()
-        if audio_stream:
-            audio_stream.close()
-        if p:
-            print("Main: Terminando PyAudio.")
-            p.terminate()
-        
-        print("Main: Recursos liberados. Servidor finalizado.")
-
-
+# --- 4. Bloco de Execução Principal ---
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("Programa principal interrompido.")
-    except Exception as e_global:
-        print(f"Erro global não tratado: {e_global}")
+        print("\nPrograma principal interrompido.")
+    finally:
+        print("Finalizando...")
+        # A limpeza de recursos como PyAudio poderia ser feita aqui, 
+        # mas como as threads são 'daemon', elas fecharão com o programa principal.
